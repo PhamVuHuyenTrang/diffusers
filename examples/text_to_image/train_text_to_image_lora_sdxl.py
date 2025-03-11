@@ -42,7 +42,9 @@ from torchvision import transforms
 from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
-
+from torch.utils.data import Dataset
+import json
+from datasets import DatasetDict, Dataset
 import diffusers
 from diffusers import (
     AutoencoderKL,
@@ -62,6 +64,10 @@ from diffusers.utils import (
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_torch_npu_available, is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
+from PIL import Image
+
+from models import UNet1024
+from attention_sharing import AttentionSharingPatcher
 
 
 if is_wandb_available():
@@ -689,14 +695,22 @@ def main(args):
 
     # now we will add new LoRA weights to the attention layers
     # Set correct lora layers
-    unet_lora_config = LoraConfig(
+    ## NEW CODE
+    unet_lora_foreground_config = LoraConfig(
+        r=args.rank,
+        lora_alpha=args.rank,
+        init_lora_weights="gaussian",
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+    )
+    unet_lora_background_config = LoraConfig(
         r=args.rank,
         lora_alpha=args.rank,
         init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
 
-    unet.add_adapter(unet_lora_config)
+    unet.add_adapter(unet_lora_foreground_config, adapter_name="foreground")
+    unet.add_adapter(unet_lora_background_config, adapter_name="background")
 
     # The text encoder comes from 🤗 transformers, we will also attach adapters to it.
     if args.train_text_encoder:
@@ -850,131 +864,183 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
-    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
+      #New code
+    class ForegroundBackgroundDataset(Dataset):
+        def __init__(self, data_dir, transform=None):
+            self.data_dir = data_dir
+            self.transform = transform
+            self.data = self.load_data()
 
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            args.dataset_name, args.dataset_config_name, cache_dir=args.cache_dir, data_dir=args.train_data_dir
-        )
-    else:
-        data_files = {}
-        if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
-        )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
+        def load_data(self):
+            dataset = []
 
-    # Preprocessing the datasets.
-    # We need to tokenize inputs and targets.
-    column_names = dataset["train"].column_names
+            # Define paths
+            foreground_dir = os.path.join(self.data_dir, "foreground")
+            background_dir = os.path.join(self.data_dir, "background")
+            prompts_file = os.path.join(self.data_dir, "prompts.txt")
 
-    # 6. Get the column names for input/target.
-    dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
-    if args.image_column is None:
-        image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
-    else:
-        image_column = args.image_column
-        if image_column not in column_names:
-            raise ValueError(
-                f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
-            )
-    if args.caption_column is None:
-        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
-    else:
-        caption_column = args.caption_column
-        if caption_column not in column_names:
-            raise ValueError(
-                f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
-            )
+            # Get sorted list of image filenames (assumes matching order in both folders)
+            foreground_files = sorted(os.listdir(foreground_dir))
+            background_files = sorted(os.listdir(background_dir))
 
-    # Preprocessing the datasets.
-    # We need to tokenize input captions and transform the images.
+            # Read prompts
+            with open(prompts_file, "r") as f:
+                prompts = [line.strip() for line in f.readlines()]
+
+            # Ensure foreground, background, and prompts are aligned
+            assert len(foreground_files) == len(background_files) == len(prompts), "Mismatch in dataset files!"
+
+            # Pair images and prompts
+            for fg_file, bg_file, prompt in zip(foreground_files, background_files, prompts):
+                foreground_path = os.path.join(foreground_dir, fg_file)
+                background_path = os.path.join(background_dir, bg_file)
+                dataset.append((foreground_path, background_path, prompt))
+
+            return dataset
+
+        def __len__(self):
+            return len(self.data)
+
+        def __getitem__(self, idx):
+            foreground_path, background_path, prompt = self.data[idx]
+            
+            # Load images
+            foreground = Image.open(foreground_path).convert("RGBA")  # Foreground with alpha channel
+            background = Image.open(background_path).convert("RGB")    # Background in RGB
+
+            if self.transform:
+                foreground = self.transform(foreground)
+                background = self.transform(background)
+
+            return foreground, background, prompt
+
+    # New code
+    foreground_imgs, backgrounds_imgs, prompts = ForegroundBackgroundDataset()
     def tokenize_captions(examples, is_train=True):
         captions = []
-        for caption in examples[caption_column]:
+        for caption in prompts: 
             if isinstance(caption, str):
                 captions.append(caption)
             elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
                 captions.append(random.choice(caption) if is_train else caption[0])
             else:
                 raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
+                    "Caption column `prompt` should contain either strings or lists of strings."
                 )
         tokens_one = tokenize_prompt(tokenizer_one, captions)
         tokens_two = tokenize_prompt(tokenizer_two, captions)
         return tokens_one, tokens_two
 
-    # Preprocessing the datasets.
-    train_resize = transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR)
-    train_crop = transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution)
-    train_flip = transforms.RandomHorizontalFlip(p=1.0)
-    train_transforms = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
 
     def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        # image aug
+        train_resize = transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR)
+        train_crop = transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution)
+        train_flip = transforms.RandomHorizontalFlip(p=1.0)
+        train_transforms = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+        backgrounds = [image.convert("RGB") for image in backgrounds_imgs]  
+        foregrounds = [image.convert("RGBA") for image in foreground_imgs]  
         original_sizes = []
-        all_images = []
+        all_backgrounds = []
+        all_foregrounds = []
         crop_top_lefts = []
-        for image in images:
-            original_sizes.append((image.height, image.width))
-            image = train_resize(image)
+        
+        for background, foreground in zip(backgrounds, foregrounds):
+            original_sizes.append((background.height, background.width))
+            background = train_resize(background)
+            foreground = train_resize(foreground)
+            
             if args.random_flip and random.random() < 0.5:
-                # flip
-                image = train_flip(image)
+                background = train_flip(background)
+                foreground = train_flip(foreground)
+            
             if args.center_crop:
-                y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
-                x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
-                image = train_crop(image)
+                y1 = max(0, int(round((background.height - args.resolution) / 2.0)))
+                x1 = max(0, int(round((background.width - args.resolution) / 2.0)))
+                background = train_crop(background)
+                foreground = train_crop(foreground)
             else:
-                y1, x1, h, w = train_crop.get_params(image, (args.resolution, args.resolution))
-                image = crop(image, y1, x1, h, w)
+                y1, x1, h, w = train_crop.get_params(background, (args.resolution, args.resolution))
+                background = crop(background, y1, x1, h, w)
+                foreground = crop(foreground, y1, x1, h, w)
+            
             crop_top_left = (y1, x1)
             crop_top_lefts.append(crop_top_left)
-            image = train_transforms(image)
-            all_images.append(image)
-
+            background = train_transforms(background)
+            foreground = train_transforms(foreground)
+            
+            all_backgrounds.append(background)
+            all_foregrounds.append(foreground)
+        
         examples["original_sizes"] = original_sizes
         examples["crop_top_lefts"] = crop_top_lefts
-        examples["pixel_values"] = all_images
+        examples["pixel_values_background"] = all_backgrounds
+        examples["pixel_values_foreground"] = all_foregrounds
         tokens_one, tokens_two = tokenize_captions(examples)
         examples["input_ids_one"] = tokens_one
         examples["input_ids_two"] = tokens_two
+    
         if args.debug_loss:
-            fnames = [os.path.basename(image.filename) for image in examples[image_column] if image.filename]
+            fnames = [os.path.basename(image.filename) for image in examples["foreground"] if image.filename]  # Using 'foreground' as the foreground column
             if fnames:
                 examples["filenames"] = fnames
         return examples
 
+    # Create datasets for foreground and background separately
+    foreground_dataset = Dataset.from_dict({"foreground": foreground_imgs, "prompts": prompts})
+    background_dataset = Dataset.from_dict({"background": backgrounds_imgs, "prompts": prompts})
+
+    # Combine datasets into a DatasetDict
+    dataset = DatasetDict({
+        "train_foreground": foreground_dataset,
+        "train_background": background_dataset
+    })
+
+    # Apply transformations and sampling within accelerator
     with accelerator.main_process_first():
         if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train, output_all_columns=True)
+            dataset["train_foreground"] = dataset["train_foreground"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+            dataset["train_background"] = dataset["train_background"].shuffle(seed=args.seed).select(range(args.max_train_samples))
 
-    def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
+        # Apply transformations
+        train_foreground_dataset = dataset["train_foreground"].with_transform(preprocess_train, output_all_columns=True)
+        train_background_dataset = dataset["train_background"].with_transform(preprocess_train, output_all_columns=True)
+
+
+    def collate_fn_foreground(examples):
+        pixel_values = torch.stack([example["pixel_values_foreground"] for example in examples])
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
         original_sizes = [example["original_sizes"] for example in examples]
         crop_top_lefts = [example["crop_top_lefts"] for example in examples]
         input_ids_one = torch.stack([example["input_ids_one"] for example in examples])
         input_ids_two = torch.stack([example["input_ids_two"] for example in examples])
         result = {
-            "pixel_values": pixel_values,
+            "pixel_values_foreground": pixel_values,
+            "input_ids_one": input_ids_one,
+            "input_ids_two": input_ids_two,
+            "original_sizes": original_sizes,
+            "crop_top_lefts": crop_top_lefts,
+        }
+
+        filenames = [example["filenames"] for example in examples if "filenames" in example]
+        if filenames:
+            result["filenames"] = filenames
+        return result
+    
+
+    def collate_fn_background(examples):
+        pixel_values = torch.stack([example["pixel_values_background"] for example in examples])
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        original_sizes = [example["original_sizes"] for example in examples]
+        crop_top_lefts = [example["crop_top_lefts"] for example in examples]
+        input_ids_one = torch.stack([example["input_ids_one"] for example in examples])
+        input_ids_two = torch.stack([example["input_ids_two"] for example in examples])
+        result = {
+            "pixel_values_background": pixel_values,
             "input_ids_one": input_ids_one,
             "input_ids_two": input_ids_two,
             "original_sizes": original_sizes,
@@ -987,13 +1053,22 @@ def main(args):
         return result
 
     # DataLoaders creation:
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
+    train_foreground_dataloader = torch.utils.data.DataLoader(
+        train_foreground_dataset,
         shuffle=True,
-        collate_fn=collate_fn,
+        collate_fn=collate_fn_foreground,
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
+    train_background_dataloader = torch.utils.data.DataLoader(
+        train_background_dataset,
+        shuffle=True,
+        collate_fn=collate_fn_background,
+        batch_size=args.train_batch_size,
+        num_workers=args.dataloader_num_workers,
+    )
+    # Combine into 1 dataloader
+    train_dataloader = zip(train_foreground_dataloader, train_background_dataloader)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -1035,7 +1110,7 @@ def main(args):
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num examples = {len(train_foreground_dataloader)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
@@ -1086,37 +1161,41 @@ def main(args):
             text_encoder_one.train()
             text_encoder_two.train()
         train_loss = 0.0
-        for step, batch in enumerate(train_dataloader):
+        for step, (foreground_batch, background_batch) in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
                 # Convert images to latent space
                 if args.pretrained_vae_model_name_or_path is not None:
-                    pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
+                    pixel_values_foreground = foreground_batch["pixel_values_foreground"].to(dtype=weight_dtype)
+                    pixel_values_background = background_batch["pixel_values_background"].to(dtype=weight_dtype)
                 else:
-                    pixel_values = batch["pixel_values"]
-
-                model_input = vae.encode(pixel_values).latent_dist.sample()
-                model_input = model_input * vae.config.scaling_factor
+                    pixel_values_foreground = background_batch["pixel_values_foreground"]
+                    pixel_values_background = foreground_batch["pixel_values_background"]
+                # New code
+                # 1. Processing foreground
+                unet.set_active_adapters("foreground")  
+                model_input_foreground = vae.encode(pixel_values_foreground).latent_dist.sample()
+                model_input_foreground = model_input_foreground * vae.config.scaling_factor
                 if args.pretrained_vae_model_name_or_path is None:
-                    model_input = model_input.to(weight_dtype)
+                    model_input_foreground = model_input_foreground.to(weight_dtype)
 
                 # Sample noise that we'll add to the latents
-                noise = torch.randn_like(model_input)
+                noise = torch.randn_like(model_input_foreground)
                 if args.noise_offset:
                     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
                     noise += args.noise_offset * torch.randn(
-                        (model_input.shape[0], model_input.shape[1], 1, 1), device=model_input.device
+                        (model_input_foreground.shape[0], model_input_foreground.shape[1], 1, 1), device=model_input_foreground.device
                     )
 
-                bsz = model_input.shape[0]
+                bsz = model_input_foreground.shape[0]
                 # Sample a random timestep for each image
                 timesteps = torch.randint(
-                    0, noise_scheduler.config.num_train_timesteps, (bsz,), device=model_input.device
+                    0, noise_scheduler.config.num_train_timesteps, (bsz,), device=model_input_foreground.device
                 )
                 timesteps = timesteps.long()
 
                 # Add noise to the model input according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
-                noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
+                noisy_model_input_foreground = noise_scheduler.add_noise(model_input_foreground, noise, timesteps)
 
                 # time ids
                 def compute_time_ids(original_size, crops_coords_top_left):
@@ -1128,7 +1207,7 @@ def main(args):
                     return add_time_ids
 
                 add_time_ids = torch.cat(
-                    [compute_time_ids(s, c) for s, c in zip(batch["original_sizes"], batch["crop_top_lefts"])]
+                    [compute_time_ids(s, c) for s, c in zip(foreground_batch["original_sizes"], foreground_batch["crop_top_lefts"])]
                 )
 
                 # Predict the noise residual
@@ -1137,11 +1216,68 @@ def main(args):
                     text_encoders=[text_encoder_one, text_encoder_two],
                     tokenizers=None,
                     prompt=None,
-                    text_input_ids_list=[batch["input_ids_one"], batch["input_ids_two"]],
+                    text_input_ids_list=[foreground_batch["input_ids_one"], foreground_batch["input_ids_two"]],
                 )
                 unet_added_conditions.update({"text_embeds": pooled_prompt_embeds})
-                model_pred = unet(
-                    noisy_model_input,
+                model_pred_foreground = unet(
+                    noisy_model_input_foreground,
+                    timesteps,
+                    prompt_embeds,
+                    added_cond_kwargs=unet_added_conditions,
+                    return_dict=False,
+                )[0]
+
+                # New code
+                # 2. Processing background
+                unet.set_active_adapters("background")  
+                model_input_background = vae.encode(pixel_values_background).latent_dist.sample()
+                model_input_background = model_input_background * vae.config.scaling_factor
+                if args.pretrained_vae_model_name_or_path is None:
+                    model_input_background = model_input_background.to(weight_dtype)
+
+                # Sample noise that we'll add to the latents
+                noise = torch.randn_like(model_input_background)
+                if args.noise_offset:
+                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
+                    noise += args.noise_offset * torch.randn(
+                        (model_input_background.shape[0], model_input_background.shape[1], 1, 1), device=model_input_background.device
+                    )
+
+                bsz = model_input_background.shape[0]
+                # Sample a random timestep for each image
+                timesteps = torch.randint(
+                    0, noise_scheduler.config.num_train_timesteps, (bsz,), device=model_input_background.device
+                )
+                timesteps = timesteps.long()
+
+                # Add noise to the model input according to the noise magnitude at each timestep
+                # (this is the forward diffusion process)
+                noisy_model_input_background = noise_scheduler.add_noise(model_input_background, noise, timesteps)
+
+                # time ids
+                def compute_time_ids(original_size, crops_coords_top_left):
+                    # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
+                    target_size = (args.resolution, args.resolution)
+                    add_time_ids = list(original_size + crops_coords_top_left + target_size)
+                    add_time_ids = torch.tensor([add_time_ids])
+                    add_time_ids = add_time_ids.to(accelerator.device, dtype=weight_dtype)
+                    return add_time_ids
+
+                add_time_ids = torch.cat(
+                    [compute_time_ids(s, c) for s, c in zip(background_batch["original_sizes"], background_batch["crop_top_lefts"])]
+                )
+
+                # Predict the noise residual
+                unet_added_conditions = {"time_ids": add_time_ids}
+                prompt_embeds, pooled_prompt_embeds = encode_prompt(
+                    text_encoders=[text_encoder_one, text_encoder_two],
+                    tokenizers=None,
+                    prompt=None,
+                    text_input_ids_list=[background_batch["input_ids_one"], background_batch["input_ids_two"]],
+                )
+                unet_added_conditions.update({"text_embeds": pooled_prompt_embeds})
+                model_pred_background = unet(
+                    noisy_model_input_background,
                     timesteps,
                     prompt_embeds,
                     added_cond_kwargs=unet_added_conditions,
@@ -1154,13 +1290,16 @@ def main(args):
                     noise_scheduler.register_to_config(prediction_type=args.prediction_type)
 
                 if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
+                    target_foreground = noise
+                    target_background = noise
                 elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(model_input, noise, timesteps)
+                    target_foreground = noise_scheduler.get_velocity(model_input_foreground, noise, timesteps)
+                    target_background = noise_scheduler.get_velocity(model_input_background, noise, timesteps)
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
                 if args.snr_gamma is None:
+                    # how to customize loss
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 else:
                     # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
